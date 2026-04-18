@@ -27,7 +27,7 @@ class EventStore:
                     track_id INTEGER NOT NULL,
                     zone_name TEXT NOT NULL,
                     start_time REAL NOT NULL,
-                    current_time REAL NOT NULL,
+                    "current_time" REAL NOT NULL,
                     duration REAL NOT NULL,
                     confidence_local REAL NOT NULL,
                     created_at TEXT NOT NULL
@@ -65,7 +65,7 @@ class EventStore:
                 """
                 INSERT OR IGNORE INTO events (
                     event_id, event_type, track_id, zone_name,
-                    start_time, current_time, duration, confidence_local, created_at
+                    start_time, "current_time", duration, confidence_local, created_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
@@ -94,7 +94,7 @@ class EventStore:
                 """
                 SELECT
                     event_id, event_type, track_id, zone_name,
-                    start_time, current_time, duration, confidence_local, created_at
+                    start_time, "current_time", duration, confidence_local, created_at
                 FROM events
                 ORDER BY created_at DESC
                 LIMIT ?
@@ -113,7 +113,7 @@ class EventStore:
                 """
                 SELECT
                     event_id, event_type, track_id, zone_name,
-                    start_time, current_time, duration, confidence_local, created_at
+                    start_time, "current_time", duration, confidence_local, created_at
                 FROM events
                 WHERE event_id = ?
                 """,
