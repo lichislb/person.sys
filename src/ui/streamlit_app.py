@@ -202,6 +202,8 @@ def main() -> None:
         output_video = st.checkbox("保存处理后视频", value=True)
         show_verbose_log = st.checkbox("显示详细日志", value=False)
         snapshot_dir = st.text_input("关键帧目录", value="data/snapshots")
+        store_events = st.checkbox("写入事件数据库", value=False)
+        alert_hold_sec = st.slider("告警持续显示时长 (s)", 0.5, 10.0, 3.0, 0.5)
 
     with st.sidebar.expander("区域配置 (JSON)", expanded=False):
         zones_text = st.text_area(
@@ -289,6 +291,8 @@ def main() -> None:
                 "max_retry": int(vlm_max_retry),
             },
             "vlm_extra_context": {"ui_verbose": bool(show_verbose_log)},
+            "store_events": bool(store_events),
+            "alert_hold_sec": float(alert_hold_sec),
         }
 
         try:
@@ -304,17 +308,19 @@ def main() -> None:
             st.error(f"视频处理失败: {exc}")
             return
 
-    # ===== Load Events =====
-    try:
-        raw_events = _load_events(db_path=db_path, limit=5000)
-        events = _normalize_events(raw_events)
-    except Exception as exc:
-        st.error(f"读取数据库失败: {exc}")
-        return
+    # ===== Load Events (optional) =====
+    events: list[dict[str, Any]] = []
+    if store_events:
+        try:
+            raw_events = _load_events(db_path=db_path, limit=5000)
+            events = _normalize_events(raw_events)
+        except Exception as exc:
+            st.error(f"读取数据库失败: {exc}")
+            return
 
     summary = st.session_state.get("last_summary", {})
     video_name = st.session_state.get("last_video_name", "N/A")
-    total_events = len(events)
+    total_events = len(events) if store_events else 0
     current_frame = summary.get("current_frame", "N/A")  # may be unavailable
     active_tracks = summary.get("num_active_tracks", "N/A")  # may be unavailable
     candidate_num = summary.get("num_candidate_events", 0)
@@ -367,7 +373,9 @@ def main() -> None:
 
     # ===== History Table =====
     st.markdown("### 历史事件表")
-    if not events:
+    if not store_events:
+        st.info("当前为“仅视频告警模式”，未启用事件存储。")
+    elif not events:
         st.info("当前数据库中暂无事件记录。")
     else:
         all_types = sorted({str(e.get("event_type", "unknown")) for e in events})
@@ -400,7 +408,9 @@ def main() -> None:
 
     # ===== Charts =====
     st.markdown("### 统计图表")
-    if not events:
+    if not store_events:
+        st.info("当前为“仅视频告警模式”，统计图基于数据库，已关闭。")
+    elif not events:
         st.info("暂无数据可用于统计图。")
     else:
         chart1, chart2 = st.columns(2)

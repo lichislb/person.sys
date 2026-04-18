@@ -141,6 +141,19 @@ def _save_snapshot(
     return path
 
 
+def _create_video_writer(path: str, fps: float, width: int, height: int) -> cv2.VideoWriter:
+    """Create a browser-friendly writer with codec fallback."""
+    codec_candidates = ["avc1", "mp4v"]
+    for codec in codec_candidates:
+        fourcc = cv2.VideoWriter_fourcc(*codec)
+        writer = cv2.VideoWriter(path, fourcc, fps, (width, height))
+        if writer.isOpened():
+            return writer
+        writer.release()
+    # last fallback keeps behavior explicit
+    raise RuntimeError(f"failed to create VideoWriter for {path}")
+
+
 def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
     """Run local MVP pipeline end-to-end."""
     components = build_components(config)
@@ -164,14 +177,20 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
     video_writer: cv2.VideoWriter | None = None
     snapshot_dir = str(config.get("snapshot_dir", "data/snapshots"))
     extra_context = config.get("vlm_extra_context", {})
+    store_events = bool(config.get("store_events", False))
+    alert_hold_sec = float(config.get("alert_hold_sec", 3.0))
+    active_alerts: dict[str, dict[str, Any]] = {}
 
     num_candidate_events = 0
     num_final_events = 0
     num_vlm_success = 0
     num_vlm_failed = 0
     num_vlm_skipped = 0
+    last_frame_id: int | None = None
+    last_num_tracks: int | None = None
 
-    event_store.init_db()
+    if store_events:
+        event_store.init_db()
     assert reader.open(), "视频打开失败，请检查 video_source"
     detector.load_model()
 
@@ -189,6 +208,7 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
             frame_id = int(frame_obj["frame_id"])
             timestamp = float(frame_obj["timestamp"])
             frame = frame_obj["image"]
+            last_frame_id = frame_id
 
             # Keep original frame on skipped steps for smooth display/output.
             person_dets: list[dict[str, Any]] = []
@@ -198,6 +218,7 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
             if sampler.should_process(frame_id):
                 person_dets = detector.predict(frame)
                 tracks = tracker.update(person_dets, image=frame)
+                last_num_tracks = len(tracks)
                 candidate_events = candidate_generator.generate(tracks=tracks, timestamp=timestamp)
                 candidate_generator.cleanup(current_time=timestamp)
                 num_candidate_events += len(candidate_events)
@@ -253,12 +274,33 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
                         review_result=review_result,
                     )
                     final_events.append(final_event)
-                    event_store.insert_event(final_event)
+                    # Keep only actionable alerts in video overlay.
+                    if str(final_event.get("final_decision", "")).lower() != "normal":
+                        alert_key = (
+                            f"{final_event.get('event_type')}_"
+                            f"{final_event.get('track_id')}_"
+                            f"{final_event.get('zone_name')}"
+                        )
+                        active_alerts[alert_key] = {
+                            **final_event,
+                            "_expire_at": float(timestamp) + max(0.1, alert_hold_sec),
+                        }
+                    if store_events:
+                        event_store.insert_event(final_event)
                     num_final_events += 1
+
+            # Persist alert rendering for a few seconds, not just trigger frame.
+            alive_alerts: list[dict[str, Any]] = []
+            for key in list(active_alerts.keys()):
+                info = active_alerts[key]
+                if float(info.get("_expire_at", 0.0)) >= float(timestamp):
+                    alive_alerts.append(info)
+                else:
+                    active_alerts.pop(key, None)
 
             vis_frame = draw_zones(frame, zones)
             vis_frame = draw_tracks(vis_frame, tracks)
-            vis_frame = draw_events(vis_frame, final_events)
+            vis_frame = draw_events(vis_frame, alive_alerts)
             vis_frame = draw_status_bar(
                 vis_frame,
                 stats={
@@ -266,15 +308,14 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
                     "timestamp": timestamp,
                     "num_dets": len(person_dets),
                     "num_tracks": len(tracks),
-                    "num_events": len(final_events),
+                    "num_events": len(alive_alerts),
                 },
             )
 
             if output_video:
                 if video_writer is None:
                     h, w = vis_frame.shape[:2]
-                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                    video_writer = cv2.VideoWriter(output_video_path, fourcc, fps, (w, h))
+                    video_writer = _create_video_writer(output_video_path, fps, w, h)
                 video_writer.write(vis_frame)
 
             if enable_window:
@@ -284,9 +325,9 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
                     print("Stopped by user (q).")
                     break
 
-            if final_events:
-                print(f"frame={frame_id} ts={timestamp:.3f} events={len(final_events)}")
-                for event in final_events:
+            if alive_alerts:
+                print(f"frame={frame_id} ts={timestamp:.3f} alerts={len(alive_alerts)}")
+                for event in alive_alerts:
                     print("  event:", event)
     finally:
         reader.release()
@@ -296,14 +337,20 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, Any]:
         if enable_window:
             cv2.destroyAllWindows()
 
-    stored_count = len(event_store.list_events(limit=100000))
-    print(f"Pipeline finished. total_events_in_db={stored_count}")
+    stored_count = 0
+    if store_events:
+        stored_count = len(event_store.list_events(limit=100000))
+        print(f"Pipeline finished. total_events_in_db={stored_count}")
+    else:
+        print("Pipeline finished. event storage disabled.")
     return {
         "num_candidate_events": num_candidate_events,
         "num_final_events": num_final_events,
         "num_vlm_success": num_vlm_success,
         "num_vlm_failed": num_vlm_failed,
         "num_vlm_skipped": num_vlm_skipped,
+        "current_frame": last_frame_id if last_frame_id is not None else "N/A",
+        "num_active_tracks": last_num_tracks if last_num_tracks is not None else "N/A",
         "total_events_in_db": stored_count,
     }
 
