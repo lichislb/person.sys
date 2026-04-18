@@ -15,48 +15,15 @@ from typing import Any
 import cv2
 import numpy as np
 
+from src.event.candidate_generator import CandidateEventGenerator
+from src.event.dwell_rules import DwellRuleEngine
 from src.event.roi_rules import IntrusionRuleEngine
+from src.event.state_manager import TrackStateManager
 from src.video.frame_sampler import FrameSampler
 from src.video.stream_reader import StreamReader
 from src.vision.detector import PersonDetector
 from src.vision.geometry import point_in_polygon
 from src.vision.tracker import ObjectTracker
-
-
-class DemoStateManager:
-    """Minimal in-memory state manager for local demo testing."""
-
-    def __init__(self) -> None:
-        self._tracks: dict[int, dict[str, Any]] = {}
-        self._zone_states: dict[tuple[int, str], dict[str, Any]] = {}
-        self._triggered_events: set[tuple[int, str, str]] = set()
-
-    def update_track(self, track_id: int, timestamp: float, bbox: Any, center: Any) -> None:
-        self._tracks[track_id] = {
-            "timestamp": float(timestamp),
-            "bbox": bbox,
-            "center": center,
-        }
-
-    def get_zone_state(self, track_id: int, zone_name: str) -> dict[str, Any] | None:
-        return self._zone_states.get((track_id, zone_name))
-
-    def mark_zone_enter(self, track_id: int, zone_name: str, timestamp: float) -> None:
-        self._zone_states[(track_id, zone_name)] = {"enter_time": float(timestamp)}
-
-    def mark_zone_exit(self, track_id: int, zone_name: str) -> None:
-        self._zone_states.pop((track_id, zone_name), None)
-        self._triggered_events = {
-            key
-            for key in self._triggered_events
-            if not (key[0] == track_id and key[1] == zone_name)
-        }
-
-    def is_event_triggered(self, track_id: int, zone_name: str, event_type: str) -> bool:
-        return (track_id, zone_name, event_type) in self._triggered_events
-
-    def set_event_triggered(self, track_id: int, zone_name: str, event_type: str) -> None:
-        self._triggered_events.add((track_id, zone_name, event_type))
 
 
 def _draw_zones(canvas: np.ndarray, zones: dict[str, dict[str, Any]]) -> None:
@@ -165,8 +132,15 @@ def main() -> None:
             "type": "service",
         },
     }
-    rule_engine = IntrusionRuleEngine(zones=zones, min_duration_sec=1.5)
-    state_manager = DemoStateManager()
+    intrusion_engine = IntrusionRuleEngine(zones=zones, min_duration_sec=1.5)
+    dwell_engine = DwellRuleEngine(zones=zones, min_duration_sec=8.0)
+    state_manager = TrackStateManager()
+    candidate_generator = CandidateEventGenerator(
+        intrusion_engine=intrusion_engine,
+        dwell_engine=dwell_engine,
+        state_manager=state_manager,
+        max_missing_sec=2.0,
+    )
     window_name = "Retail Security Demo (Press q to quit)"
     save_output = True
     output_path = "output_demo.mp4"
@@ -195,16 +169,8 @@ def main() -> None:
             image = frame_obj["image"]
             person_dets = detector.predict(image)
             tracks = tracker.update(person_dets, image=image)
-
-            frame_events: list[dict[str, Any]] = []
-            for track in tracks:
-                events = rule_engine.check_track(
-                    track=track,
-                    timestamp=timestamp,
-                    state_manager=state_manager,
-                )
-                if events:
-                    frame_events.extend(events)
+            frame_events = candidate_generator.generate(tracks=tracks, timestamp=timestamp)
+            candidate_generator.cleanup(current_time=timestamp)
 
             vis = image.copy()
             _draw_zones(vis, zones)
@@ -214,7 +180,7 @@ def main() -> None:
             if frame_events:
                 first_event = frame_events[0]
                 hint = (
-                    f"ALERT intrusion: id={first_event['track_id']} "
+                    f"ALERT {first_event['event_type']}: id={first_event['track_id']} "
                     f"zone={first_event['zone_name']} dur={first_event['duration']:.2f}s"
                 )
                 cv2.putText(
@@ -248,7 +214,7 @@ def main() -> None:
                 f"dets={len(person_dets)} tracks={len(tracks)} events={len(frame_events)}"
             )
             for event in frame_events:
-                print("  intrusion_event:", event)
+                print(f"  {event['event_type']}_event:", event)
     finally:
         reader.release()
         if video_writer is not None:
