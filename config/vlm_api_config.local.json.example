@@ -1,0 +1,7 @@
+{
+  "base_url": "https://your-api-host/v1",
+  "api_key": "YOUR_API_KEY",
+  "model_name": "your-vision-model",
+  "timeout_sec": 20,
+  "max_retry": 2
+}

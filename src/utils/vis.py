@@ -100,12 +100,17 @@ def draw_events(frame: np.ndarray, events: list[dict[str, Any]] | None) -> np.nd
         event_type = str(event.get("event_type", "event"))
         track_id = event.get("track_id", "?")
         zone_name = str(event.get("zone_name", "zone"))
+        final_decision = str(event.get("final_decision", "local_only"))
+        risk_level = str(event.get("risk_level", "unknown"))
         try:
             duration = float(event.get("duration", 0.0))
         except (TypeError, ValueError):
             duration = 0.0
 
-        text = f"{idx + 1}. {event_type} id={track_id} zone={zone_name} dur={duration:.2f}s"
+        text = (
+            f"{idx + 1}. {event_type} id={track_id} zone={zone_name} "
+            f"dur={duration:.2f}s decision={final_decision} risk={risk_level}"
+        )
         color = (0, 0, 255) if event_type == "intrusion" else (0, 165, 255)
         cv2.putText(
             canvas,

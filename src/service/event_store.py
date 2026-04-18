@@ -18,7 +18,8 @@ class EventStore:
     def init_db(self) -> None:
         """Create database and events table if not exists."""
         self._ensure_parent_dir()
-        with self._connect() as conn:
+        conn = self._connect()
+        try:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS events (
@@ -30,11 +31,19 @@ class EventStore:
                     "current_time" REAL NOT NULL,
                     duration REAL NOT NULL,
                     confidence_local REAL NOT NULL,
+                    review_status TEXT,
+                    confidence_vlm REAL,
+                    risk_level TEXT,
+                    explanation TEXT,
+                    final_decision TEXT,
                     created_at TEXT NOT NULL
                 )
                 """
             )
+            self._ensure_optional_columns(conn)
             conn.commit()
+        finally:
+            conn.close()
 
     def insert_event(self, event: dict[str, Any]) -> None:
         """Insert one event with simple deduplication by event_id."""
@@ -57,16 +66,24 @@ class EventStore:
             confidence_local = float(event.get("confidence_local", 0.0))
         except (TypeError, ValueError):
             return
+        review_status = event.get("review_status")
+        confidence_vlm = event.get("confidence_vlm")
+        risk_level = event.get("risk_level")
+        explanation = event.get("explanation")
+        final_decision = event.get("final_decision")
 
         created_at = datetime.now(timezone.utc).isoformat()
 
-        with self._connect() as conn:
+        conn = self._connect()
+        try:
             conn.execute(
                 """
                 INSERT OR IGNORE INTO events (
                     event_id, event_type, track_id, zone_name,
-                    start_time, "current_time", duration, confidence_local, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    start_time, "current_time", duration, confidence_local,
+                    review_status, confidence_vlm, risk_level, explanation, final_decision,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event_id,
@@ -77,10 +94,17 @@ class EventStore:
                     current_time,
                     duration,
                     confidence_local,
+                    None if review_status is None else str(review_status),
+                    self._safe_float(confidence_vlm),
+                    None if risk_level is None else str(risk_level),
+                    None if explanation is None else str(explanation),
+                    None if final_decision is None else str(final_decision),
                     created_at,
                 ),
             )
             conn.commit()
+        finally:
+            conn.close()
 
     def list_events(self, limit: int = 100) -> list[dict[str, Any]]:
         """List events ordered by creation time descending."""
@@ -89,18 +113,23 @@ class EventStore:
         except (TypeError, ValueError):
             lim = 100
 
-        with self._connect() as conn:
+        conn = self._connect()
+        try:
             rows = conn.execute(
                 """
                 SELECT
                     event_id, event_type, track_id, zone_name,
-                    start_time, "current_time", duration, confidence_local, created_at
+                    start_time, "current_time", duration, confidence_local,
+                    review_status, confidence_vlm, risk_level, explanation, final_decision,
+                    created_at
                 FROM events
                 ORDER BY created_at DESC
                 LIMIT ?
                 """,
                 (lim,),
             ).fetchall()
+        finally:
+            conn.close()
         return [self._row_to_event_dict(r) for r in rows]
 
     def get_event(self, event_id: str) -> dict[str, Any] | None:
@@ -108,17 +137,22 @@ class EventStore:
         eid = str(event_id or "").strip()
         if not eid:
             return None
-        with self._connect() as conn:
+        conn = self._connect()
+        try:
             row = conn.execute(
                 """
                 SELECT
                     event_id, event_type, track_id, zone_name,
-                    start_time, "current_time", duration, confidence_local, created_at
+                    start_time, "current_time", duration, confidence_local,
+                    review_status, confidence_vlm, risk_level, explanation, final_decision,
+                    created_at
                 FROM events
                 WHERE event_id = ?
                 """,
                 (eid,),
             ).fetchone()
+        finally:
+            conn.close()
         if row is None:
             return None
         return self._row_to_event_dict(row)
@@ -128,11 +162,14 @@ class EventStore:
         eid = str(event_id or "").strip()
         if not eid:
             return False
-        with self._connect() as conn:
+        conn = self._connect()
+        try:
             row = conn.execute(
                 "SELECT 1 FROM events WHERE event_id = ? LIMIT 1",
                 (eid,),
             ).fetchone()
+        finally:
+            conn.close()
         return row is not None
 
     def _connect(self) -> sqlite3.Connection:
@@ -144,6 +181,23 @@ class EventStore:
         parent = os.path.dirname(self.db_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
+
+    @staticmethod
+    def _ensure_optional_columns(conn: sqlite3.Connection) -> None:
+        existing_cols = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(events)").fetchall()
+        }
+        optional_defs = {
+            "review_status": "TEXT",
+            "confidence_vlm": "REAL",
+            "risk_level": "TEXT",
+            "explanation": "TEXT",
+            "final_decision": "TEXT",
+        }
+        for col, col_type in optional_defs.items():
+            if col not in existing_cols:
+                conn.execute(f"ALTER TABLE events ADD COLUMN {col} {col_type}")
 
     def _make_event_id(self, event: dict[str, Any]) -> str:
         """Generate stable and readable event_id."""
@@ -170,5 +224,21 @@ class EventStore:
             "current_time": float(row["current_time"]),
             "duration": float(row["duration"]),
             "confidence_local": float(row["confidence_local"]),
+            "review_status": row["review_status"],
+            "confidence_vlm": EventStore._safe_float(row["confidence_vlm"]),
+            "risk_level": row["risk_level"] if row["risk_level"] is not None else "unknown",
+            "explanation": row["explanation"] if row["explanation"] is not None else "",
+            "final_decision": row["final_decision"]
+            if row["final_decision"] is not None
+            else "local_only",
             "created_at": row["created_at"],
         }
+
+    @staticmethod
+    def _safe_float(value: Any) -> float | None:
+        try:
+            if value is None:
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
